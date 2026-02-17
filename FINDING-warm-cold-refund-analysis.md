@@ -147,6 +147,100 @@ No escalation path to state corruption or soundness violation was identified.
 
 ---
 
+## Deep-Dive: Can Refund Inflation Bypass Any Hard Per-Block Bound?
+
+A targeted investigation was conducted to determine whether inflated warm/cold refunds
+could bypass any hard or implicit per-block capacity limit in the proof system.
+
+### Hard bounds identified
+
+| Bound | Value | Location | Enforced how |
+|-------|-------|----------|-------------|
+| SCHEDULER_CAPACITY | 28,000 total circuit instances | `circuit_definitions/recursion_layer/mod.rs:38` | Scheduler loop count baked into proving key (`scheduler/mod.rs:1056`), with hard assertion all types must complete (`scheduler/mod.rs:1266`) |
+| Per-VM-instance cycles | 5,390 (production) | `GeometryConfig.cycles_per_vm_snapshot` | Fixed loop in VM circuit |
+| RECURSION_TIP_ARITY | 32 | `recursion/recursion_tip/input.rs:24` | Fixed-size array for per-type queues |
+| NUM_BASE_LAYER_CIRCUITS | 20 types | `recursion/mod.rs:10` | Enum + fixed-size arrays throughout |
+
+### How the scheduler creates a hard per-block bound
+
+The scheduler circuit (`scheduler/mod.rs:1056-1266`) processes **one base-layer circuit instance
+per iteration** for exactly `config.capacity = SCHEDULER_CAPACITY = 28,000` iterations. Every VM
+snapshot, storage sorter instance, storage applicator instance, etc. consumes one slot. After the
+loop, the circuit enforces `execution_flag == false` (line 1266) — meaning all 20 circuit types
+must have completed. If a block requires > 28,000 total instances, the proof is unsatisfiable.
+
+This value is chosen to fit the scheduler circuit within a 2^20 trace size (comment at lines 32-37).
+
+### The gas-to-circuit coupling design
+
+`ERGS_PER_CIRCUIT = 80,000` (`system_params.rs:12`) is the designed invariant: 80K ergs of
+computation should fill approximately one circuit instance. The pricing generator
+(`circuit_pricing_generator/main.rs`) derives all opcode costs from this:
+
+- Cold SLOAD: 2,008 ergs = 4 (VM) + 1 (RAM) + 1 (demuxer) + 2 (sorter) + 2,000 (cold access)
+- Warm SLOAD: 38 ergs = 4 (VM) + 1 (RAM) + 1 (demuxer) + 2 (sorter) + 30 (warm access)
+- Refund delta: 1,970 ergs per inflated SLOAD
+
+### Why inflation CANNOT bypass SCHEDULER_CAPACITY
+
+The decisive factor is **VM_INITIAL_FRAME_ERGS = u32::MAX ≈ 4.3 billion ergs**
+(`system_params.rs:9`, enforced at `loading.rs:45-46`).
+
+For N unique cold SLOADs, the circuit instances required (using production geometry):
+
+```
+Instances(N) ≈ N/5390 [VM] + N/33 [storage_app] + N/44171 [sorter] + N/58125 [demuxer]
+             ≈ N × 0.0305
+```
+
+**Gas-bounded maximum (no inflation):**
+```
+N_gas = u32::MAX / 2008 ≈ 2,139,000 SLOADs
+Instances = 2,139,000 × 0.0305 ≈ 65,239  →  ALREADY EXCEEDS 28,000
+```
+
+**Circuit-bounded maximum:**
+```
+N_circuit = 28,000 / 0.0305 ≈ 918,000 SLOADs
+```
+
+Even **without** inflated refunds, the bootloader's 4.3B ergs can sustain ~2.14M SLOADs —
+far more than the ~918K that circuit capacity allows. **The circuit capacity is already the
+binding constraint.** Refund inflation cannot push past a bound that is already reached under
+honest accounting.
+
+**With inflation:** u32::MAX / 38 ≈ 113M SLOADs → still bounded by circuit capacity at ~918K.
+The inflation is immaterial.
+
+### On the pricing-model numbers (optimistic case for attacker)
+
+The pricing generator uses larger capacities than actual geometry (e.g., `CYCLES_PER_STORAGE_APPLICATION = 118`
+vs production `33`). Using pricing-model numbers:
+
+- Without inflation: ~2.14M ops → ~18,524 instances (66% of 28,000)
+- With inflation: ~3.23M ops → ~28,000 instances (100% of 28,000)
+
+Even in this most-favorable framing, the operator needs inflation only to fill the last ~34% of
+scheduler capacity — and can already fill 66% without it. Moreover, the operator can achieve the
+same result by simply including more transactions with legitimate gas consumption, since they
+control transaction inclusion.
+
+### Recursion structure: no additional bound
+
+- **Leaf layer**: Tree recursion per circuit type — unbounded instances per type.
+- **Node layer**: Intermediate tree aggregation — unbounded.
+- **Recursion tip**: `ARITY=32` bounds circuit **types** (20 ≤ 32), not instances per type.
+- **Public inputs**: `keccak256(prev_hash || this_hash)` → 4 field elements (`scheduler/mod.rs:1507-1527`). No commitment to circuit counts.
+
+### Verdict on escalation
+
+**No present-day escalation.** The warm/cold refund inflation cannot bypass `SCHEDULER_CAPACITY`
+because the bootloader's u32::MAX ergs already provides enough gas to exceed circuit capacity
+without inflation. The circuit-instance bound — not the gas bound — is the operational limit
+for an adversarial operator.
+
+---
+
 ## Severity Justification
 
 **LOW / INFORMATIONAL** because:
@@ -181,10 +275,21 @@ No escalation path to state corruption or soundness violation was identified.
 | `main_vm/opcodes/log.rs` | 387-417 | Refund witness allocation and bounding |
 | `main_vm/opcodes/log.rs` | 459-472 | Cost check (before refund) |
 | `main_vm/opcodes/log.rs` | 668-688 | Refund application |
-| `main_vm/cycle.rs` | 454-469 | ergs_remaining propagation |
+| `main_vm/opcodes/log.rs` | 779-819 | Queue push enables gated by `should_apply` |
+| `main_vm/cycle.rs` | 454-469 | ergs_remaining propagation across cycles |
 | `main_vm/cycle.rs` | 493-533 | Pubdata counter constraints (for comparison) |
+| `main_vm/loading.rs` | 45-46 | VM_INITIAL_FRAME_ERGS = u32::MAX (circuit-enforced) |
+| `main_vm/pre_state.rs` | 257-261 | ergs_remaining read at cycle start |
 | `base_structures/log_query/mod.rs` | 32-44 | LogQuery struct (no refund field) |
 | `main_vm/mod.rs` | 102-124 | Fixed cycle count, completion check |
 | `fsm_input_output/circuit_inputs/main_vm.rs` | 47-51 | VmOutputData (no gas output) |
-| `zkevm_opcode_defs/src/system_params.rs` | — | MAX_TX_ERGS_LIMIT (software-only) |
+| `scheduler/mod.rs` | 1056-1263 | Scheduler loop — 28,000 iterations processing circuit instances |
+| `scheduler/mod.rs` | 1266 | Hard assertion: all circuit types must complete |
+| `circuit_definitions/recursion_layer/mod.rs` | 32-38 | SCHEDULER_CAPACITY = 28,000 |
+| `recursion/recursion_tip/input.rs` | 24, 30-33 | RECURSION_TIP_ARITY = 32, fixed-size arrays |
+| `zkevm_opcode_defs/src/system_params.rs` | 7, 9, 12 | MAX_TX_ERGS_LIMIT, VM_INITIAL_FRAME_ERGS, ERGS_PER_CIRCUIT |
+| `zkevm_opcode_defs/src/circuit_pricing_generator/main.rs` | 9-33, 78-156 | Gas-to-circuit coupling design |
+| `zkevm_opcode_defs/src/circuit_prices.rs` | 4-28 | Generated per-operation ergs costs |
+| `zkevm_opcode_defs/src/definitions/log.rs` | 103-118 | StorageRead/Write ergs_price (cold costs) |
+| `boojum/src/gadgets/queue/mod.rs` | 594-611 | QueueState includes length (UInt32) |
 | `circuit_definitions/aux_definitions/witness_oracle.rs` | 204-236 | get_cold_warm_refund implementation |
